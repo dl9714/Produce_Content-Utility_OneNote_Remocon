@@ -1,4 +1,5 @@
 OneNote 전자필기장 스크롤 리모컨 (OneNote Scroll Remocon)
+![bandicam 2025-11-07 17-16-25-137](https://github.com/user-attachments/assets/3524f99e-4583-4be8-a8eb-4044a1a4b887)
 
 ![alt text](https://img.shields.io/badge/Python-3.8+-blue.svg)
 
