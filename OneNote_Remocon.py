@@ -10,7 +10,6 @@ from typing import Optional, List, Dict, Any
 
 from PyQt6.QtWidgets import (
     QApplication,
-    # QWidget, # QWidget은 이제 직접 상속하지 않으므로 없어도 됩니다.
     QVBoxLayout,
     QHBoxLayout,
     QPushButton,
@@ -26,9 +25,10 @@ from PyQt6.QtWidgets import (
     QInputDialog,
     QMessageBox,
     QAbstractItemView,
-    QMainWindow,  # 이 부분이 반드시 있어야 합니다.
+    QMainWindow,
     QFileDialog,
-    QWidget,  # central_widget을 위해 QWidget도 필요합니다.
+    QWidget,
+    QLineEdit,
 )
 from PyQt6.QtCore import (
     QThread,
@@ -43,20 +43,20 @@ from PyQt6.QtGui import QIcon, QAction
 
 # ----------------- 0. 전역 상수 -----------------
 SETTINGS_FILE = "OneNote_Remocon_Setting.json"
-APP_ICON_PATH = "app_icon.ico"  # 사용할 아이콘 파일 경로 (ICO 형식 권장)
+APP_ICON_PATH = "app_icon.ico"
 
-ONENOTE_CLASS_NAME = "ApplicationFrameWindow"  # UWP/Modern OneNote Class Name
+ONENOTE_CLASS_NAME = "ApplicationFrameWindow"
 SCROLL_STEP_SENSITIVITY = 40
 
-# QTreeWidget 커스텀 데이터 롤
-ROLE_TYPE = Qt.ItemDataRole.UserRole + 1  # 'group' | 'section'
-ROLE_DATA = Qt.ItemDataRole.UserRole + 2  # dict payload
+ROLE_TYPE = Qt.ItemDataRole.UserRole + 1
+ROLE_DATA = Qt.ItemDataRole.UserRole + 2
 
-# ----------------- 0.0 설정 파일 로드/저장 유틸리티 -----------------
+# ----------------- 0.0 설정 파일 로드/저장 유틸리티 (즐겨찾기 버퍼 구조 추가) -----------------
 DEFAULT_SETTINGS = {
     "window_geometry": {"x": 200, "y": 180, "width": 960, "height": 540},
     "connection_signature": None,
-    "favorites": [],
+    "favorites_buffers": {"기본 즐겨찾기 버퍼": []},
+    "active_buffer": "기본 즐겨찾기 버퍼",
 }
 
 
@@ -66,10 +66,19 @@ def load_settings() -> Dict[str, Any]:
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # 기본 설정과 병합하여 키 누락 방지
-            settings = DEFAULT_SETTINGS.copy()
-            settings.update(data)
-            return settings
+
+        # 하위 호환성을 위한 마이그레이션 로직
+        if "favorites" in data and "favorites_buffers" not in data:
+            print(
+                "[INFO] 구 버전 설정 감지. 새 즐겨찾기 버퍼 구조로 마이그레이션합니다."
+            )
+            data["favorites_buffers"] = {"기본 즐겨찾기 버퍼": data["favorites"]}
+            data["active_buffer"] = "기본 즐겨찾기 버퍼"
+            del data["favorites"]
+
+        settings = DEFAULT_SETTINGS.copy()
+        settings.update(data)
+        return settings
     except Exception as e:
         print(f"[ERROR] 설정 파일 로드 실패: {e}")
         return DEFAULT_SETTINGS.copy()
@@ -77,6 +86,9 @@ def load_settings() -> Dict[str, Any]:
 
 def save_settings(data: Dict[str, Any]):
     try:
+        if "favorites" in data:
+            del data["favorites"]
+
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -98,6 +110,7 @@ _pwa_ready = False
 
 def ensure_pywinauto():
     global _pwa_ready, Desktop, WindowNotFoundError, ElementNotFoundError, TimeoutError, UIAWrapper, UIAElementInfo, mouse, keyboard
+    # NameError 수정: _ppa_ready -> _pwa_ready
     if _pwa_ready:
         return
     try:
@@ -124,7 +137,6 @@ def ensure_pywinauto():
         keyboard = _keyboard
         _pwa_ready = True
     except ImportError:
-        # pywinauto가 없으면 자동화 기능은 비활성 상태
         pass
 
 
@@ -140,7 +152,6 @@ def _win_get_window_text(hwnd):
 
 
 def _win_get_class_name(hwnd):
-    # 중복 호출 버그 수정
     buf = ctypes.create_unicode_buffer(256)
     _user32.GetClassNameW(hwnd, buf, 256)
     return buf.value
@@ -192,10 +203,8 @@ def resource_path(relative_path):
     PyInstaller에서 묶인 리소스 파일을 찾는 경로를 반환합니다.
     """
     try:
-        # PyInstaller 실행 환경: 임시 폴더 경로를 사용
         base_path = sys._MEIPASS
     except Exception:
-        # 개발 환경: 현재 디렉토리 경로를 사용
         base_path = os.path.abspath(".")
 
     return os.path.join(base_path, relative_path)
@@ -205,26 +214,53 @@ def resource_path(relative_path):
 def get_process_image_path(pid: int) -> Optional[str]:
     if not pid:
         return None
+
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    kernel32 = ctypes.windll.kernel32
+
+    # 64비트 안전: use_last_error로 WinAPI 에러 사용 가능
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
     OpenProcess = kernel32.OpenProcess
-    CloseHandle = kernel32.CloseHandle
+    OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    OpenProcess.restype = wintypes.HANDLE
+
     QueryFullProcessImageNameW = kernel32.QueryFullProcessImageNameW
+    QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    QueryFullProcessImageNameW.restype = wintypes.BOOL
+
+    CloseHandle = kernel32.CloseHandle
+    CloseHandle.argtypes = [wintypes.HANDLE]
+    CloseHandle.restype = wintypes.BOOL
 
     hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not hProcess:
         return None
     try:
-        buf_len = wintypes.DWORD(1024)
-        buf = ctypes.create_unicode_buffer(buf_len.value)
-        if QueryFullProcessImageNameW(hProcess, 0, buf, ctypes.byref(buf_len)):
-            return buf.value
-        return None
+        # 1차 버퍼
+        size = 512
+        while True:
+            buf_len = wintypes.DWORD(size)
+            buf = ctypes.create_unicode_buffer(buf_len.value)
+            ok = QueryFullProcessImageNameW(hProcess, 0, buf, ctypes.byref(buf_len))
+            if ok:
+                return buf.value
+            # 버퍼 부족 시 한 번 정도 키워 봄
+            err = ctypes.get_last_error()
+            # ERROR_INSUFFICIENT_BUFFER = 122
+            if err == 122 and size < 4096:
+                size *= 2
+                continue
+            return None
     finally:
         CloseHandle(hProcess)
 
 
-# ----------------- 1.1 엄격한 OneNote 창 검증 헬퍼 (2번 로직 이식) -----------------
+# ----------------- 1.1 엄격한 OneNote 창 검증 헬퍼 -----------------
 def is_strict_onenote_window(w: Dict[str, Any], my_pid: int) -> bool:
     """주어진 창 정보가 실제로 OneNote 앱 창인지 엄격하게 확인합니다."""
     if w.get("pid") == my_pid:
@@ -298,7 +334,7 @@ def _scroll_vertical_via_pattern(
         return False
 
 
-# ----------------- 6. 마우스 휠 기반 스크롤(폴백) - 2번 로직 이식 -----------------
+# ----------------- 6. 마우스 휠 기반 스크롤(폴백) -----------------
 def _safe_wheel(scroll_container, steps: int):
     if steps == 0:
         return
@@ -345,7 +381,7 @@ def _safe_wheel(scroll_container, steps: int):
         pass
 
 
-# ----------------- 7. 선택 항목을 가장 빠르게 얻기 - 2번 로직 이식 -----------------
+# ----------------- 7. 선택 항목을 가장 빠르게 얻기 -----------------
 def get_selected_tree_item_fast(tree_control):
     ensure_pywinauto()
     if not _pwa_ready:
@@ -408,7 +444,7 @@ def _find_tree_or_list(onenote_window):
     return None
 
 
-# ----------------- 8.1 지정 텍스트 섹션 찾기/선택 - 2번 로직 이식 -----------------
+# ----------------- 8.1 지정 텍스트 섹션 찾기/선택 -----------------
 def _normalize_text(s: Optional[str]) -> str:
     return " ".join(((s or "").strip().split())).lower()
 
@@ -465,7 +501,6 @@ def _center_element_in_view(element_to_center, scroll_container):
         try:
             element_to_center.iface_scroll_item.ScrollIntoView()
         except AttributeError:
-            # ScrollItem 미지원 컨트롤
             return
 
         _wait_rect_settle(
@@ -510,7 +545,7 @@ def _center_element_in_view(element_to_center, scroll_container):
         print(f"[WARN] 중앙 정렬 중 오류: {e}")
 
 
-# ----------------- 10. 선택된 항목을 중앙으로 스크롤 - 2번 로직 이식 -----------------
+# ----------------- 10. 선택된 항목을 중앙으로 스크롤 -----------------
 def scroll_selected_item_to_center(
     onenote_window, tree_control: Optional[object] = None
 ):
@@ -792,6 +827,8 @@ class FavoritesTree(QTreeWidget):
     structureChanged = pyqtSignal()
     deleteRequested = pyqtSignal()
     renameRequested = pyqtSignal()
+    copyRequested = pyqtSignal()
+    pasteRequested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -808,50 +845,36 @@ class FavoritesTree(QTreeWidget):
         self.setExpandsOnDoubleClick(True)
 
     def dropEvent(self, event):
-        # 드래그 중인 아이템과 드롭 대상 아이템을 미리 가져옵니다.
         source_item = self.currentItem()
         target_item = self.itemAt(event.position().toPoint())
 
-        # 소스 아이템이 없으면 이벤트를 무시합니다.
         if not source_item:
             event.ignore()
             return
 
-        # 먼저 Qt의 기본 드롭 이벤트를 실행하여 아이템을 이동시킵니다.
-        # 이렇게 하면 복잡한 이동 로직을 직접 구현할 필요가 없습니다.
         super().dropEvent(event)
 
-        # 이제, 이동된 결과를 확인하고 규칙에 어긋나면 위치를 수정합니다.
         if target_item and source_item.parent() == target_item:
             source_type = source_item.data(0, ROLE_TYPE)
             target_type = target_item.data(0, ROLE_TYPE)
 
-            # 규칙: '섹션'은 다른 '섹션'의 자식이 될 수 없습니다.
             if source_type == "section" and target_type == "section":
-                # 1. 잘못된 위치(target_item)에서 source_item을 다시 떼어냅니다.
                 moved_item = target_item.takeChild(
                     target_item.indexOfChild(source_item)
                 )
 
                 if moved_item:
-                    # 2. target_item의 부모(즉, 한 단계 위 그룹)를 찾습니다.
                     parent_of_target = target_item.parent()
                     if not parent_of_target:
                         parent_of_target = self.invisibleRootItem()
-
-                    # 3. target_item의 인덱스를 찾습니다.
                     target_index = parent_of_target.indexOfChild(target_item)
-
-                    # 4. 떼어냈던 아이템을 target_item 바로 다음에 삽입합니다.
                     parent_of_target.insertChild(target_index + 1, moved_item)
-
-                    # 5. 사용자가 위치를 인지할 수 있도록 이동된 아이템을 선택합니다.
                     self.setCurrentItem(moved_item)
 
-        # 구조가 변경되었음을 알립니다 (저장을 위함).
         self.structureChanged.emit()
 
     def keyPressEvent(self, event):
+        # Delete, F2 처리
         if event.key() == Qt.Key.Key_Delete:
             self.deleteRequested.emit()
             event.accept()
@@ -860,6 +883,18 @@ class FavoritesTree(QTreeWidget):
             self.renameRequested.emit()
             event.accept()
             return
+
+        # Ctrl+C / Ctrl+V 처리
+        if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            if event.key() == Qt.Key.Key_C:
+                self.copyRequested.emit()
+                event.accept()
+                return
+            if event.key() == Qt.Key.Key_V:
+                self.pasteRequested.emit()
+                event.accept()
+                return
+
         super().keyPressEvent(event)
 
 
@@ -878,17 +913,21 @@ class OneNoteScrollRemoconApp(QMainWindow):
         self.onenote_windows_info: List[Dict] = []
         self.my_pid = os.getpid()
         self._auto_center_after_activate = True
+        self.active_buffer_name = None
+
+        # 즐겨찾기 복사 데이터 임시 저장소 (클립보드 역할)
+        self.clipboard_data: Optional[Dict] = None
+
+        # 즐겨찾기 버퍼 복사 데이터 임시 저장소
+        self.buffer_clipboard_data: Optional[Dict] = None
 
         # 1.1 애플리케이션 아이콘 설정
         icon_path = resource_path(APP_ICON_PATH)
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
-        # --- [오류 수정] ---
-        # 설정 파일에서 geo 값을 가져올 때 딕셔너리인지 확인
         geo = self.settings.get("window_geometry")
         if isinstance(geo, dict):
-            # 딕셔너리가 맞으면 해당 값으로 창 위치 설정
             self.setGeometry(
                 geo.get("x", 200),
                 geo.get("y", 180),
@@ -896,19 +935,20 @@ class OneNoteScrollRemoconApp(QMainWindow):
                 geo.get("height", 540),
             )
         else:
-            # 딕셔너리가 아니거나(리스트 등) 없으면 기본값으로 설정
             self.setGeometry(200, 180, 960, 540)
-            # 메모리의 설정도 올바르게 수정하여, 앱 종료 시 정상적으로 저장되도록 함
             self.settings["window_geometry"] = DEFAULT_SETTINGS["window_geometry"]
-        # --- [수정 완료] ---
 
         self.init_ui("준비됨 (자동 재연결 중...)")
 
-        # 2. 즐겨찾기 로드
-        self._load_favorites()
+        # 2. 즐겨찾기 버퍼 및 즐겨찾기 로드
+        self._load_buffers_and_favorites()
 
         self.fav_tree.deleteRequested.connect(self._delete_favorite_item)
         self.fav_tree.renameRequested.connect(self._rename_favorite_item)
+
+        # 복사/붙여넣기 시그널 연결
+        self.fav_tree.copyRequested.connect(self._copy_favorite_item)
+        self.fav_tree.pasteRequested.connect(self._paste_favorite_item)
 
         QTimer.singleShot(0, self.refresh_onenote_list)
         QTimer.singleShot(0, self._start_auto_reconnect)
@@ -928,7 +968,7 @@ class OneNoteScrollRemoconApp(QMainWindow):
         import_action.triggered.connect(self._import_favorites)
         file_menu.addAction(import_action)
 
-        # --- 스타일시트 정의 ---
+        # --- 스타일시트 정의 (생략) ---
         COLOR_BACKGROUND = "#2E2E2E"
         COLOR_PRIMARY_TEXT = "#E0E0E0"
         COLOR_SECONDARY_TEXT = "#B0B0B0"
@@ -1033,7 +1073,6 @@ class OneNoteScrollRemoconApp(QMainWindow):
                 font-size: 9pt;
                 border-top: 1px solid #444444;
             }}
-            /* --- [추가] 검색 입력창 스타일 --- */
             QLineEdit {{
                 background-color: {COLOR_LIST_BG};
                 border: 1px solid {COLOR_SECONDARY_BUTTON};
@@ -1043,7 +1082,6 @@ class OneNoteScrollRemoconApp(QMainWindow):
             QLineEdit:focus {{
                 border: 1px solid {COLOR_LIST_SELECTED};
             }}
-            /* --- [추가 완료] --- */
         """
         )
 
@@ -1054,51 +1092,105 @@ class OneNoteScrollRemoconApp(QMainWindow):
         main_layout.setContentsMargins(12, 12, 12, 12)
         main_layout.setSpacing(10)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setChildrenCollapsible(False)
-        main_layout.addWidget(splitter, stretch=1)
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_splitter.setChildrenCollapsible(False)
+        main_layout.addWidget(main_splitter, stretch=1)
 
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
+        left_splitter = QSplitter(Qt.Orientation.Horizontal)
+        left_splitter.setChildrenCollapsible(False)
+
+        # 1. 즐겨찾기 버퍼 관리 패널 (가장 왼쪽)
+        buffer_panel = QWidget()
+        buffer_layout = QVBoxLayout(buffer_panel)
+        buffer_layout.setContentsMargins(0, 0, 0, 0)
+        buffer_layout.setSpacing(8)
+
+        buffer_group = QGroupBox("즐겨찾기 버퍼")
+        buffer_group_layout = QVBoxLayout(buffer_group)
+
+        # 즐겨찾기 버퍼 상단 툴바: 추가, 이름변경
+        buffer_toolbar_top_layout = QHBoxLayout()
+        self.btn_add_buffer = QToolButton()
+        self.btn_add_buffer.setText("추가")
+        self.btn_add_buffer.clicked.connect(self._add_buffer)
+
+        self.btn_rename_buffer = QToolButton()
+        self.btn_rename_buffer.setText("이름변경")
+        self.btn_rename_buffer.clicked.connect(self._rename_buffer)
+
+        buffer_toolbar_top_layout.addWidget(self.btn_add_buffer)
+        buffer_toolbar_top_layout.addWidget(self.btn_rename_buffer)
+        buffer_toolbar_top_layout.addStretch(1)
+        buffer_group_layout.addLayout(buffer_toolbar_top_layout)
+
+        self.buffer_list_widget = QListWidget()
+        self.buffer_list_widget.currentItemChanged.connect(self._on_buffer_changed)
+        self.buffer_list_widget.itemSelectionChanged.connect(
+            self._update_buffer_move_button_state
+        )
+        self.buffer_list_widget.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.buffer_list_widget.customContextMenuRequested.connect(
+            self._on_buffer_context_menu
+        )
+
+        buffer_group_layout.addWidget(self.buffer_list_widget)
+
+        # 즐겨찾기 버퍼 하단 툴바: 삭제, 위로, 아래로
+        buffer_toolbar_bottom_layout = QHBoxLayout()
+        self.btn_delete_buffer = QToolButton()
+        self.btn_delete_buffer.setText("삭제")
+        self.btn_delete_buffer.clicked.connect(self._delete_buffer)
+
+        self.btn_buffer_move_up = QToolButton()
+        self.btn_buffer_move_up.setText("▲ 위로")
+        self.btn_buffer_move_up.clicked.connect(self._move_buffer_up)
+
+        self.btn_buffer_move_down = QToolButton()
+        self.btn_buffer_move_down.setText("▼ 아래로")
+        self.btn_buffer_move_down.clicked.connect(self._move_buffer_down)
+
+        buffer_toolbar_bottom_layout.addWidget(self.btn_delete_buffer)
+        buffer_toolbar_bottom_layout.addStretch(1)
+        buffer_toolbar_bottom_layout.addWidget(self.btn_buffer_move_up)
+        buffer_toolbar_bottom_layout.addWidget(self.btn_buffer_move_down)
+        buffer_group_layout.addLayout(buffer_toolbar_bottom_layout)
+
+        buffer_layout.addWidget(buffer_group)
+        left_splitter.addWidget(buffer_panel)
+
+        # 2. 즐겨찾기 관리 패널 (중앙)
+        favorites_panel = QWidget()
+        left_layout = QVBoxLayout(favorites_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(8)
 
         fav_group = QGroupBox("즐겨찾기")
         fav_layout = QVBoxLayout(fav_group)
 
-        # 툴바 - 1행
+        # 툴바 - 1행: 그룹추가, 현재 섹션 추가, 이름 바꾸기
         tb1_layout = QHBoxLayout()
         self.btn_add_group = QToolButton()
         self.btn_add_group.setText("그룹 추가")
         self.btn_add_group.clicked.connect(self._add_group)
-
         self.btn_add_section_current = QToolButton()
         self.btn_add_section_current.setText("현재 섹션 추가")
         self.btn_add_section_current.clicked.connect(self._add_section_from_current)
-
         self.btn_rename = QToolButton()
         self.btn_rename.setText("이름 바꾸기 (F2)")
         self.btn_rename.clicked.connect(self._rename_favorite_item)
-
-        # --- [수정] 버튼 위치 교체 (1) ---
-        tb1_layout.addWidget(
-            self.btn_add_section_current
-        )  # "현재 섹션 추가"를 먼저 배치
+        tb1_layout.addWidget(self.btn_add_section_current)
         tb1_layout.addWidget(self.btn_rename)
         tb1_layout.addStretch(1)
 
-        # 툴바 - 2행
+        # 툴바 - 2행: 그룹 펼치기, 접기 (삭제 버튼은 하단으로 이동)
         tb2_layout = QHBoxLayout()
-        self.btn_delete = QToolButton()
-        self.btn_delete.setText("삭제 (Del)")
-        self.btn_delete.clicked.connect(self._delete_favorite_item)
         self.btn_expand_all = QToolButton()
         self.btn_expand_all.setText("그룹 펼치기")
         self.btn_collapse_all = QToolButton()
         self.btn_collapse_all.setText("그룹 접기")
-
-        # --- [수정] 버튼 위치 교체 (2) ---
-        tb2_layout.addWidget(self.btn_add_group)  # "그룹 추가"를 두 번째 줄로 배치
+        tb2_layout.addWidget(self.btn_add_group)
         tb2_layout.addStretch(1)
         tb2_layout.addWidget(self.btn_expand_all)
         tb2_layout.addWidget(self.btn_collapse_all)
@@ -1114,34 +1206,36 @@ class OneNoteScrollRemoconApp(QMainWindow):
         self.fav_tree.customContextMenuRequested.connect(self._on_fav_context_menu)
         self.fav_tree.structureChanged.connect(self._save_favorites)
         self.fav_tree.itemChanged.connect(lambda *_: self._save_favorites())
-
         fav_layout.addWidget(self.fav_tree)
 
-        # --- [수정] 하단 버튼 레이아웃 재구성 ---
+        # 즐겨찾기 하단 툴바: 삭제, 위로, 아래로 (삭제 버튼 재배치)
         move_buttons_layout = QHBoxLayout()
-        move_buttons_layout.addWidget(self.btn_delete)  # 왼쪽에 "삭제" 버튼 추가
+
+        # 삭제 버튼 (tb2에서 이동)
+        self.btn_delete = QToolButton()
+        self.btn_delete.setText("삭제 (Del)")
+        self.btn_delete.clicked.connect(self._delete_favorite_item)
+        move_buttons_layout.addWidget(self.btn_delete)
+
         move_buttons_layout.addStretch(1)
 
         self.btn_move_up = QToolButton()
         self.btn_move_up.setText("▲ 위로")
         self.btn_move_up.clicked.connect(self._move_item_up)
-
         self.btn_move_down = QToolButton()
         self.btn_move_down.setText("▼ 아래로")
         self.btn_move_down.clicked.connect(self._move_item_down)
-
         move_buttons_layout.addWidget(self.btn_move_up)
         move_buttons_layout.addWidget(self.btn_move_down)
-
         fav_layout.addLayout(move_buttons_layout)
-        # --- [수정 완료] ---
 
         self.fav_tree.itemSelectionChanged.connect(self._update_move_button_state)
-
         left_layout.addWidget(fav_group, stretch=1)
-        splitter.addWidget(left_panel)
-        splitter.setStretchFactor(0, 0)
 
+        left_splitter.addWidget(favorites_panel)
+        main_splitter.addWidget(left_splitter)
+
+        # 3. 오른쪽 패널 (변경 없음)
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -1216,30 +1310,18 @@ class OneNoteScrollRemoconApp(QMainWindow):
 
         right_layout.addWidget(actions_group)
 
-        # --- [수정] '전자필기장 검색' 그룹을 별도로 생성 ---
-        # QLineEdit를 추가하기 위해 PyQt6.QtWidgets 임포트 목록에 추가해야 합니다.
-        try:
-            from PyQt6.QtWidgets import QLineEdit
-        except ImportError:  # 혹시 모를 상황 대비
-            QLineEdit = lambda: QWidget()
+        search_group = QGroupBox("전자필기장 검색")
+        search_group_layout = QVBoxLayout(search_group)
 
-        search_group = QGroupBox("전자필기장 검색")  # 새 그룹박스 생성
-        search_group_layout = QVBoxLayout(search_group)  # 그룹박스를 위한 레이아웃
-
-        search_widget_layout = QHBoxLayout()  # 입력창, 버튼을 담을 가로 레이아웃
-
-        # '전자필기장 검색:' 라벨 생성 코드 삭제
+        search_widget_layout = QHBoxLayout()
 
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText(
-            "검색할 섹션 이름 입력..."
-        )  # 안내 문구 수정
+        self.search_input.setPlaceholderText("검색할 섹션 이름 입력...")
         self.search_input.returnPressed.connect(self._search_and_select_section)
         self.search_input.setEnabled(False)
         search_widget_layout.addWidget(self.search_input, stretch=1)
 
         self.search_button = QPushButton("전자필기장 위치")
-        # '검색' 버튼 스타일 변경
         self.search_button.setStyleSheet(
             """
             QPushButton {
@@ -1264,18 +1346,19 @@ class OneNoteScrollRemoconApp(QMainWindow):
 
         search_group_layout.addLayout(search_widget_layout)
         right_layout.addWidget(search_group)
-        # --- [수정 완료] ---
 
         right_layout.addStretch(1)
-        splitter.addWidget(right_panel)
-        splitter.setStretchFactor(1, 1)
+        main_splitter.addWidget(right_panel)
 
         self.connection_status_label = QLabel(initial_status)
         self.statusBar().addPermanentWidget(self.connection_status_label)
         self.statusBar().setStyleSheet(f"background-color: {COLOR_STATUS_BAR};")
 
-        splitter.setSizes([320, 640])
+        left_splitter.setSizes([150, 250])
+        main_splitter.setSizes([400, 560])
+
         self._update_move_button_state()
+        self._update_buffer_move_button_state()
 
     # ----------------- 14.1 창 닫기 이벤트 핸들러 (Geometry/Favorites 저장) -----------------
     def closeEvent(self, event):
@@ -1297,10 +1380,8 @@ class OneNoteScrollRemoconApp(QMainWindow):
     def update_status_and_ui(self, status_text: str, is_connected: bool):
         self.connection_status_label.setText(status_text)
         self.center_button.setEnabled(is_connected)
-        # --- [추가] 검색 관련 UI 활성화/비활성화 ---
         self.search_input.setEnabled(is_connected)
         self.search_button.setEnabled(is_connected)
-        # --- [추가 완료] ---
 
     def _start_auto_reconnect(self):
         self.refresh_button.setEnabled(False)
@@ -1419,7 +1500,6 @@ class OneNoteScrollRemoconApp(QMainWindow):
         self.tree_control = None
         self.update_status_and_ui("연결 해제됨.", False)
 
-        # 연결 시그니처만 지우기
         current_settings = load_settings()
         current_settings["connection_signature"] = None
         save_settings(current_settings)
@@ -1454,7 +1534,6 @@ class OneNoteScrollRemoconApp(QMainWindow):
         if success:
             self.update_status_and_ui(f"성공: '{item_name}' 중앙 정렬 완료.", True)
         else:
-            # 한번 더 컨테이너 재탐색 후 재시도
             self.tree_control = _find_tree_or_list(self.onenote_window)
             success, item_name = scroll_selected_item_to_center(
                 self.onenote_window, self.tree_control
@@ -1476,42 +1555,108 @@ class OneNoteScrollRemoconApp(QMainWindow):
             self.update_status_and_ui("검색할 내용을 입력하세요.", True)
             return
 
-        # tree_control이 캐시되지 않았을 경우를 대비해 다시 한 번 탐색
         if not self.tree_control:
             self.tree_control = _find_tree_or_list(self.onenote_window)
 
         self.update_status_and_ui(f"'{search_text}' 섹션을 검색 중...", True)
 
-        # 텍스트로 섹션 검색 및 선택
         success = select_section_by_text(
             self.onenote_window, search_text, self.tree_control
         )
 
         if success:
-            # 선택 성공 시, 잠시 후 중앙 정렬 실행 (UI 반영 시간 고려)
             QTimer.singleShot(100, self.center_selected_item_action)
-            # 상태바는 즉시 업데이트
             self.update_status_and_ui(f"검색 성공: '{search_text}' 선택 완료.", True)
         else:
             self.update_status_and_ui(
                 f"검색 실패: '{search_text}' 섹션을 찾을 수 없습니다.", True
             )
 
-    # ----------------- 15. 즐겨찾기 로드/세이브 -----------------
-    def _load_favorites(self):
+    # ----------------- 15. 즐겨찾기 로드/세이브 (즐겨찾기 버퍼 시스템 적용) -----------------
+    def _load_buffers_and_favorites(self, select_row: int = -1):
+        """설정에서 즐겨찾기 버퍼 목록을 불러와 UI에 표시하고, 활성화된 즐겨찾기 버퍼의 즐겨찾기를 로드합니다."""
+        self.buffer_list_widget.blockSignals(True)
+        self.buffer_list_widget.clear()
+
+        buffers = self.settings.get("favorites_buffers", {})
+        if not buffers:
+            buffers = DEFAULT_SETTINGS["favorites_buffers"]
+            self.settings["favorites_buffers"] = buffers
+
+        buffer_names = list(buffers.keys())
+        self.buffer_list_widget.addItems(buffer_names)
+
+        active_buffer = self.settings.get("active_buffer")
+        target_row = -1
+
+        if select_row != -1:
+            if 0 <= select_row < len(buffer_names):
+                target_row = select_row
+                active_buffer = buffer_names[select_row]
+        elif active_buffer in buffer_names:
+            target_row = buffer_names.index(active_buffer)
+        elif self.buffer_list_widget.count() > 0:
+            target_row = 0
+            active_buffer = buffer_names[0]
+
+        if target_row != -1:
+            self.buffer_list_widget.setCurrentRow(target_row)
+            self.active_buffer_name = active_buffer
+
+        self.buffer_list_widget.blockSignals(False)
+        self._update_buffer_move_button_state()
+
+        if self.active_buffer_name:
+            self._load_tree_from_buffer(self.active_buffer_name)
+
+    def _load_tree_from_buffer(self, buffer_name: str):
+        """지정된 즐겨찾기 버퍼 이름에 해당하는 즐겨찾기 데이터를 트리에 로드합니다."""
         self.fav_tree.clear()
+        self.active_buffer_name = buffer_name
 
-        data = self.settings.get("favorites", [])
+        favorites_data = self.settings.get("favorites_buffers", {}).get(buffer_name, [])
 
-        if isinstance(data, list):
-            for node in data:
+        if isinstance(favorites_data, list):
+            for node in favorites_data:
                 self._append_fav_node(self.fav_tree.invisibleRootItem(), node)
+
         self.fav_tree.expandAll()
+        self.settings["active_buffer"] = buffer_name
+        self._save_settings_to_file()
+
+    def _save_favorites(self):
+        """현재 활성화된 즐겨찾기 버퍼의 즐겨찾기 트리 상태를 설정에 저장합니다."""
+        if not self.active_buffer_name:
+            return
+
+        try:
+            data = []
+            root = self.fav_tree.invisibleRootItem()
+            for i in range(root.childCount()):
+                data.append(self._serialize_fav_item(root.child(i)))
+
+            if "favorites_buffers" not in self.settings:
+                self.settings["favorites_buffers"] = {}
+            self.settings["favorites_buffers"][self.active_buffer_name] = data
+
+            self._save_settings_to_file()
+
+        except Exception as e:
+            print(f"[ERROR] 즐겨찾기 저장 실패: {e}")
+
+    def _save_settings_to_file(self):
+        """현재 self.settings 객체를 파일에 저장합니다."""
+        save_settings(self.settings)
 
     def _export_favorites(self):
-        # 1. 현재 즐겨찾기 데이터를 직렬화합니다.
         self._save_favorites()
-        favorites_data = self.settings.get("favorites", [])
+        if not self.active_buffer_name:
+            QMessageBox.warning(self, "내보내기", "활성화된 즐겨찾기 버퍼가 없습니다.")
+            return
+
+        favorites_data = self.settings["favorites_buffers"].get(
+            self.active_buffer_name, []
+        )
 
         if not favorites_data:
             QMessageBox.information(
@@ -1519,21 +1664,18 @@ class OneNoteScrollRemoconApp(QMainWindow):
             )
             return
 
-        # --- [추가] 현재 날짜와 시간으로 기본 파일 이름 생성 ---
-        # 형식: OneNote_Remocon_Favorites_YYYY-MM-DD_HH-MM-SS.json
         timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-        default_filename = f"OneNote_Remocon_Favorites_{timestamp}.json"
-        # --- [추가 완료] ---
+        default_filename = (
+            f"OneNote_Favorites_{self.active_buffer_name}_{timestamp}.json"
+        )
 
-        # 2. 파일 저장 대화상자를 엽니다.
         file_path, _ = QFileDialog.getSaveFileName(
             self,
-            "즐겨찾기 내보내기",
-            default_filename,  # --- [수정] 동적으로 생성된 이름 사용 ---
+            "현재 즐겨찾기 버퍼 즐겨찾기 내보내기",
+            default_filename,
             "JSON Files (*.json);;All Files (*)",
         )
 
-        # 3. 사용자가 파일을 선택한 경우 데이터를 저장합니다.
         if file_path:
             try:
                 with open(file_path, "w", encoding="utf-8") as f:
@@ -1549,28 +1691,64 @@ class OneNoteScrollRemoconApp(QMainWindow):
                 )
 
     def _import_favorites(self):
-        # 1. 파일 열기 대화상자를 바로 엽니다. (확인 창 제거)
-        file_path, _ = QFileDialog.getOpenFileName(
+        reply = QMessageBox.question(
             self,
             "즐겨찾기 가져오기",
-            "",  # 기본 경로
-            "JSON Files (*.json);;All Files (*)",
+            "새 즐겨찾기 버퍼를 만들어 가져오시겠습니까?\n\n"
+            "(아니오를 선택하면 현재 활성 즐겨찾기 버퍼에 덮어씁니다)",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel,
         )
 
-        # 2. 사용자가 파일을 선택한 경우 데이터를 불러옵니다.
+        if reply == QMessageBox.StandardButton.Cancel:
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "즐겨찾기 가져오기", "", "JSON Files (*.json);;All Files (*)"
+        )
+
         if file_path:
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
                     imported_data = json.load(f)
 
-                # 3. 데이터 형식이 리스트인지 기본적인 검사를 수행합니다.
                 if not isinstance(imported_data, list):
                     raise ValueError("올바른 즐겨찾기 파일 형식이 아닙니다.")
 
-                # 4. 불러온 데이터로 설정과 UI를 업데이트합니다.
-                self.settings["favorites"] = imported_data
-                self._load_favorites()  # 트리 UI 새로고침
-                self._save_favorites()  # 앱의 기본 설정 파일에도 저장
+                if reply == QMessageBox.StandardButton.Yes:
+                    base_name = os.path.splitext(os.path.basename(file_path))[0]
+                    new_buffer_name, ok = QInputDialog.getText(
+                        self,
+                        "새 즐겨찾기 버퍼 이름",
+                        "가져올 즐겨찾기 버퍼의 이름을 입력하세요:",
+                        text=base_name,
+                    )
+                    if not ok or not new_buffer_name:
+                        return
+
+                    self.settings["favorites_buffers"][new_buffer_name] = imported_data
+                    self._load_buffers_and_favorites()
+                    items = self.buffer_list_widget.findItems(
+                        new_buffer_name, Qt.MatchFlag.MatchExactly
+                    )
+                    if items:
+                        self.buffer_list_widget.setCurrentItem(items[0])
+
+                else:
+                    if not self.active_buffer_name:
+                        QMessageBox.critical(
+                            self,
+                            "오류",
+                            "활성화된 즐겨찾기 버퍼가 없어 가져올 수 없습니다.",
+                        )
+                        return
+                    self.settings["favorites_buffers"][
+                        self.active_buffer_name
+                    ] = imported_data
+                    self._load_tree_from_buffer(self.active_buffer_name)
+
+                self._save_settings_to_file()
                 QMessageBox.information(
                     self, "성공", "즐겨찾기를 성공적으로 가져왔습니다."
                 )
@@ -1579,21 +1757,6 @@ class OneNoteScrollRemoconApp(QMainWindow):
                 QMessageBox.critical(
                     self, "오류", f"파일을 불러오는 중 오류가 발생했습니다:\n{e}"
                 )
-
-    def _save_favorites(self):
-        try:
-            data = []
-            root = self.fav_tree.invisibleRootItem()
-            for i in range(root.childCount()):
-                data.append(self._serialize_fav_item(root.child(i)))
-
-            current_settings = load_settings()
-            current_settings["favorites"] = data
-            save_settings(current_settings)
-
-            self.settings["favorites"] = data
-        except Exception as e:
-            print(f"[ERROR] 즐겨찾기 저장 실패: {e}")
 
     def _serialize_fav_item(self, item: QTreeWidgetItem) -> Dict[str, Any]:
         node_type = item.data(0, ROLE_TYPE)
@@ -1649,6 +1812,330 @@ class OneNoteScrollRemoconApp(QMainWindow):
             self._append_fav_node(item, ch)
         return item
 
+    # ----------------- 15-2. 즐겨찾기 버퍼 순서 변경 로직 -----------------
+    def _update_buffer_move_button_state(self):
+        """즐겨찾기 버퍼 목록에서 선택된 항목에 따라 이동 버튼 활성화 상태를 업데이트합니다."""
+        row = self.buffer_list_widget.currentRow()
+        count = self.buffer_list_widget.count()
+
+        is_selected = row != -1
+
+        if hasattr(self, "btn_buffer_move_up"):
+            self.btn_buffer_move_up.setEnabled(is_selected and row > 0)
+            self.btn_buffer_move_down.setEnabled(is_selected and row < count - 1)
+
+    def _move_buffer_up(self):
+        """선택된 즐겨찾기 버퍼를 위로 이동시킵니다."""
+        current_row = self.buffer_list_widget.currentRow()
+        if current_row > 0:
+            self._swap_buffer_list(current_row, current_row - 1)
+
+    def _move_buffer_down(self):
+        """선택된 즐겨찾기 버퍼를 아래로 이동시킵니다."""
+        current_row = self.buffer_list_widget.currentRow()
+        count = self.buffer_list_widget.count()
+        if current_row < count - 1:
+            self._swap_buffer_list(current_row, current_row + 1)
+
+    def _swap_buffer_list(self, index1, index2):
+        """실제 즐겨찾기 버퍼 순서 변경 로직 (설정 데이터 및 UI 업데이트)"""
+
+        buffer_names = [
+            self.buffer_list_widget.item(i).text()
+            for i in range(self.buffer_list_widget.count())
+        ]
+
+        if 0 <= index1 < len(buffer_names) and 0 <= index2 < len(buffer_names):
+            buffer_names[index1], buffer_names[index2] = (
+                buffer_names[index2],
+                buffer_names[index1],
+            )
+        else:
+            return
+
+        old_buffers = self.settings["favorites_buffers"]
+        new_buffers = {}
+        for name in buffer_names:
+            if name in old_buffers:
+                new_buffers[name] = old_buffers[name]
+
+        self.settings["favorites_buffers"] = new_buffers
+        self._save_settings_to_file()
+
+        self._load_buffers_and_favorites(select_row=index2)
+
+    # ----------------- 15-3. 즐겨찾기 버퍼 관리 및 이벤트 핸들러 -----------------
+    def _on_buffer_changed(self, current, previous):
+        """즐겨찾기 버퍼 리스트에서 선택 항목이 변경될 때 호출됩니다."""
+        self._update_buffer_move_button_state()
+
+        if current is not None:
+            new_buffer_name = current.text()
+            if new_buffer_name != self.active_buffer_name:
+                self._load_tree_from_buffer(new_buffer_name)
+
+    def _add_buffer(self):
+        """새 즐겨찾기 버퍼를 추가합니다."""
+        buffer_name, ok = QInputDialog.getText(
+            self, "새 즐겨찾기 버퍼", "새 즐겨찾기 버퍼의 이름을 입력하세요:"
+        )
+        if ok and buffer_name:
+            buffer_name = buffer_name.strip()
+            if not buffer_name:
+                return
+
+            if buffer_name in self.settings["favorites_buffers"]:
+                QMessageBox.warning(self, "오류", "이미 존재하는 이름입니다.")
+                return
+
+            self.settings["favorites_buffers"][buffer_name] = []
+            self._save_settings_to_file()
+
+            self._load_buffers_and_favorites()
+            items = self.buffer_list_widget.findItems(
+                buffer_name, Qt.MatchFlag.MatchExactly
+            )
+            if items:
+                self.buffer_list_widget.setCurrentItem(items[0])
+
+    def _rename_buffer(self):
+        """선택된 즐겨찾기 버퍼의 이름을 변경합니다."""
+        current_item = self.buffer_list_widget.currentItem()
+        if not current_item:
+            return
+
+        old_name = current_item.text()
+        new_name, ok = QInputDialog.getText(
+            self, "즐겨찾기 버퍼 이름 변경", "새 이름을 입력하세요:", text=old_name
+        )
+
+        if ok and new_name and new_name.strip() != old_name:
+            new_name = new_name.strip()
+            if not new_name:
+                return
+
+            if new_name in self.settings["favorites_buffers"]:
+                QMessageBox.warning(self, "오류", "이미 존재하는 이름입니다.")
+                return
+
+            buffer_names = [
+                self.buffer_list_widget.item(i).text()
+                for i in range(self.buffer_list_widget.count())
+            ]
+            old_buffers = self.settings["favorites_buffers"]
+            new_buffers = {}
+            for name in buffer_names:
+                if name == old_name:
+                    new_buffers[new_name] = old_buffers[old_name]
+                elif name in old_buffers:
+                    new_buffers[name] = old_buffers[name]
+
+            self.settings["favorites_buffers"] = new_buffers
+
+            if self.settings["active_buffer"] == old_name:
+                self.settings["active_buffer"] = new_name
+
+            self._save_settings_to_file()
+
+            self._load_buffers_and_favorites()
+            items = self.buffer_list_widget.findItems(
+                new_name, Qt.MatchFlag.MatchExactly
+            )
+            if items:
+                self.buffer_list_widget.setCurrentItem(items[0])
+
+    def _delete_buffer(self):
+        """선택된 즐겨찾기 버퍼를 삭제합니다."""
+        current_item = self.buffer_list_widget.currentItem()
+        if not current_item:
+            return
+
+        if self.buffer_list_widget.count() <= 1:
+            QMessageBox.warning(
+                self, "삭제 불가", "최소 하나 이상의 즐겨찾기 버퍼가 필요합니다."
+            )
+            return
+
+        buffer_name = current_item.text()
+        reply = QMessageBox.question(
+            self,
+            "즐겨찾기 버퍼 삭제",
+            f"'{buffer_name}' 즐겨찾기 버퍼를 정말 삭제하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            deleted_name = current_item.text()
+
+            if deleted_name in self.settings["favorites_buffers"]:
+                del self.settings["favorites_buffers"][deleted_name]
+
+            if self.settings["active_buffer"] == deleted_name:
+                remaining_buffers = list(self.settings["favorites_buffers"].keys())
+                self.settings["active_buffer"] = (
+                    remaining_buffers[0] if remaining_buffers else None
+                )
+
+            self._save_settings_to_file()
+            self._load_buffers_and_favorites()
+
+    # ----------------- 15-4. 즐겨찾기 버퍼 복사/붙여넣기 및 메뉴 처리 -----------------
+    def _copy_buffer(self):
+        """선택된 즐겨찾기 버퍼의 내용을 복사합니다."""
+        current_item = self.buffer_list_widget.currentItem()
+        if not current_item:
+            return
+
+        buffer_name = current_item.text()
+        buffer_data = self.settings["favorites_buffers"].get(buffer_name)
+
+        if buffer_data is not None:
+            self.buffer_clipboard_data = {"name": buffer_name, "data": buffer_data}
+            self.connection_status_label.setText(
+                f"즐겨찾기 버퍼 '{buffer_name}' 복사됨."
+            )
+
+    def _paste_buffer(self):
+        """클립보드의 즐겨찾기 버퍼 내용을 새 즐겨찾기 버퍼로 붙여넣습니다."""
+        if not self.buffer_clipboard_data:
+            QMessageBox.warning(
+                self, "붙여넣기 오류", "복사된 즐겨찾기 버퍼가 없습니다."
+            )
+            return
+
+        base_name = self.buffer_clipboard_data["name"]
+
+        new_buffer_name, ok = QInputDialog.getText(
+            self,
+            "즐겨찾기 버퍼 붙여넣기",
+            "새 즐겨찾기 버퍼 이름:",
+            text=f"복사본 - {base_name}",
+        )
+
+        if ok and new_buffer_name:
+            new_buffer_name = new_buffer_name.strip()
+            if not new_buffer_name:
+                return
+
+            if new_buffer_name in self.settings["favorites_buffers"]:
+                QMessageBox.warning(self, "오류", "이미 존재하는 이름입니다.")
+                return
+
+            self.settings["favorites_buffers"][new_buffer_name] = (
+                self.buffer_clipboard_data["data"]
+            )
+            self._save_settings_to_file()
+
+            self._load_buffers_and_favorites()
+            items = self.buffer_list_widget.findItems(
+                new_buffer_name, Qt.MatchFlag.MatchExactly
+            )
+            if items:
+                self.buffer_list_widget.setCurrentItem(items[0])
+
+            self.connection_status_label.setText(
+                f"즐겨찾기 버퍼 '{new_buffer_name}' 붙여넣기 완료."
+            )
+
+    def _on_buffer_context_menu(self, pos):
+        """즐겨찾기 버퍼 목록 우클릭 메뉴를 표시합니다."""
+        current_item = self.buffer_list_widget.currentItem()
+        menu = QMenu(self)
+
+        # 기본 기능
+        act_add = QAction("추가", self)
+        act_add.triggered.connect(self._add_buffer)
+        menu.addAction(act_add)
+
+        if current_item:
+            act_rename = QAction("이름 변경", self)
+            act_rename.triggered.connect(self._rename_buffer)
+            menu.addAction(act_rename)
+
+            act_delete = QAction("삭제", self)
+            act_delete.triggered.connect(self._delete_buffer)
+            menu.addAction(act_delete)
+
+            # 즐겨찾기 버퍼 이동 (UI 버튼과 동일 기능)
+            menu.addSeparator()
+            act_move_up = QAction("위로 이동", self)
+            act_move_up.setEnabled(self.btn_buffer_move_up.isEnabled())
+            act_move_up.triggered.connect(self._move_buffer_up)
+            menu.addAction(act_move_up)
+
+            act_move_down = QAction("아래로 이동", self)
+            act_move_down.setEnabled(self.btn_buffer_move_down.isEnabled())
+            act_move_down.triggered.connect(self._move_buffer_down)
+            menu.addAction(act_move_down)
+
+            # 복사
+            menu.addSeparator()
+            act_copy = QAction("복사", self)
+            act_copy.triggered.connect(self._copy_buffer)
+            menu.addAction(act_copy)
+
+        # 붙여넣기 (클립보드 데이터 존재 여부에 따라 활성화)
+        act_paste = QAction("붙여넣기", self)
+        act_paste.triggered.connect(self._paste_buffer)
+        act_paste.setEnabled(self.buffer_clipboard_data is not None)
+        menu.addAction(act_paste)
+
+        menu.exec(self.buffer_list_widget.viewport().mapToGlobal(pos))
+
+    # ----------------- 16-1. 즐겨찾기 복사/붙여넣기 로직 -----------------
+    def _copy_favorite_item(self):
+        """선택된 즐겨찾기 항목을 복사합니다."""
+        item = self._current_fav_item()
+        if not item:
+            return
+
+        self.clipboard_data = self._serialize_fav_item(item)
+        self.connection_status_label.setText(
+            f"'{item.text(0)}' 항목 복사됨."
+        )  # 상태바 알림 사용
+
+    def _paste_favorite_item(self):
+        """클립보드에 있는 즐겨찾기 항목을 붙여넣습니다."""
+        if not self.clipboard_data:
+            QMessageBox.warning(
+                self, "붙여넣기 오류", "클립보드에 복사된 항목이 없습니다."
+            )
+            return
+
+        parent = self._current_fav_item()
+
+        if parent and parent.data(0, ROLE_TYPE) == "section":
+            parent = parent.parent()
+
+        parent = parent or self.fav_tree.invisibleRootItem()
+
+        def _deep_copy_node(node: Dict[str, Any]) -> Dict[str, Any]:
+            new_node = node.copy()
+            new_node["id"] = str(uuid.uuid4())
+            # new_node["name"] = f"복사본 - {new_node['name']}" # 이 줄을 제거하거나 주석 처리
+            if "children" in new_node:
+                new_node["children"] = [
+                    _deep_copy_node(child) for child in new_node["children"]
+                ]
+            return new_node
+
+        try:
+            copied_node = _deep_copy_node(self.clipboard_data)
+
+            new_item = self._append_fav_node(parent, copied_node)
+
+            self.fav_tree.setCurrentItem(new_item)
+
+            self._save_favorites()
+            self.connection_status_label.setText(
+                f"'{new_item.text(0)}' 항목 붙여넣기 완료."
+            )  # 상태바 알림 사용
+
+        except Exception as e:
+            QMessageBox.critical(
+                self, "붙여넣기 오류", f"항목을 붙여넣는 중 오류가 발생했습니다: {e}"
+            )
+
     # ----------------- 16. 즐겨찾기 조작 -----------------
     def _current_fav_item(self) -> Optional[QTreeWidgetItem]:
         items = self.fav_tree.selectedItems()
@@ -1663,21 +2150,10 @@ class OneNoteScrollRemoconApp(QMainWindow):
         index = parent.indexOfChild(item)
 
         if index > 0:
-            # --- [추가] ---
-            # 이동 전, 아이템의 펼침 상태를 저장합니다.
             is_expanded = item.isExpanded()
-            # --- [추가 완료] ---
-
-            # 아이템을 잠시 떼어낸 후, 한 칸 위 인덱스에 다시 삽입합니다.
             taken_item = parent.takeChild(index)
             parent.insertChild(index - 1, taken_item)
-
-            # --- [추가] ---
-            # 이동 후, 저장해둔 펼침 상태를 복원합니다.
             taken_item.setExpanded(is_expanded)
-            # --- [추가 완료] ---
-
-            # 이동된 아이템을 다시 선택하여 포커스를 유지합니다.
             self.fav_tree.setCurrentItem(taken_item)
             self._save_favorites()
             self._update_move_button_state()
@@ -1690,21 +2166,11 @@ class OneNoteScrollRemoconApp(QMainWindow):
         parent = item.parent() or self.fav_tree.invisibleRootItem()
         index = parent.indexOfChild(item)
 
-        # 마지막 아이템이 아닌 경우에만 이동합니다.
         if index < parent.childCount() - 1:
-            # --- [추가] ---
-            # 이동 전, 아이템의 펼침 상태를 저장합니다.
             is_expanded = item.isExpanded()
-            # --- [추가 완료] ---
-
             taken_item = parent.takeChild(index)
             parent.insertChild(index + 1, taken_item)
-
-            # --- [추가] ---
-            # 이동 후, 저장해둔 펼침 상태를 복원합니다.
             taken_item.setExpanded(is_expanded)
-            # --- [추가 완료] ---
-
             self.fav_tree.setCurrentItem(taken_item)
             self._save_favorites()
             self._update_move_button_state()
@@ -1712,7 +2178,6 @@ class OneNoteScrollRemoconApp(QMainWindow):
     def _update_move_button_state(self):
         item = self._current_fav_item()
 
-        # 선택된 아이템이 없으면 두 버튼 모두 비활성화합니다.
         if not item:
             self.btn_move_up.setEnabled(False)
             self.btn_move_down.setEnabled(False)
@@ -1721,9 +2186,7 @@ class OneNoteScrollRemoconApp(QMainWindow):
         parent = item.parent() or self.fav_tree.invisibleRootItem()
         index = parent.indexOfChild(item)
 
-        # 첫 번째 아이템이면 '위로' 버튼을 비활성화합니다.
         self.btn_move_up.setEnabled(index > 0)
-        # 마지막 아이템이면 '아래로' 버튼을 비활성화합니다.
         self.btn_move_down.setEnabled(index < parent.childCount() - 1)
 
     def _add_group(self):
@@ -1867,6 +2330,19 @@ class OneNoteScrollRemoconApp(QMainWindow):
         act_add_other.triggered.connect(self._add_section_from_other_window)
         menu.addAction(act_add_other)
 
+        # 복사/붙여넣기 메뉴
+        menu.addSeparator()
+
+        act_copy = QAction("복사 (Ctrl+C)", self)
+        act_copy.triggered.connect(self._copy_favorite_item)
+        act_copy.setEnabled(item is not None)
+        menu.addAction(act_copy)
+
+        act_paste = QAction("붙여넣기 (Ctrl+V)", self)
+        act_paste.triggered.connect(self._paste_favorite_item)
+        act_paste.setEnabled(self.clipboard_data is not None)
+        menu.addAction(act_paste)
+
         if item:
             menu.addSeparator()
             act_rename = QAction("이름 바꾸기 (F2)", self)
@@ -1948,30 +2424,23 @@ class OneNoteScrollRemoconApp(QMainWindow):
                             ),
                         )
                         self.update_status_and_ui(f"활성화: '{display_name}'", True)
-                    # --- [핵심 수정 로직] ---
                     else:
-                        # 실패 시: 이름 변경 및 상태바 업데이트 (알림창 제거)
                         current_name = item.text(0)
 
-                        # 아직 (구) 접미사가 없는 경우에만 이름 변경 수행
                         if not current_name.startswith("(구) "):
                             new_name = f"(구) {current_name}"
                             item.setText(0, new_name)
-                            # 변경된 이름을 설정 파일에 즉시 저장
                             self._save_favorites()
 
-                            # 상태바에 실패 및 이름 변경 사실을 알림
                             status_message = (
                                 f"섹션 찾기 실패: '{new_name}'(으)로 변경됨"
                             )
                             self.update_status_and_ui(status_message, True)
                         else:
-                            # 이미 (구) 접미사가 있는 경우, 실패 사실만 알림
                             status_message = (
                                 f"섹션 찾기 실패: '{current_name}' 섹션을 찾을 수 없음"
                             )
                             self.update_status_and_ui(status_message, True)
-                    # --- [수정 로직 끝] ---
                     return
 
         self.update_status_and_ui(f"활성화: '{display_name}'", True)
@@ -1983,7 +2452,6 @@ if __name__ == "__main__":
     ex = OneNoteScrollRemoconApp()
     ex.show()
 
-    # 이중 연결 방지 및 그룹 토글 기능 복원
     try:
         ex.fav_tree.itemDoubleClicked.disconnect()
     except TypeError:
