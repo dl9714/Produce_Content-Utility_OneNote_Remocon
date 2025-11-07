@@ -51,6 +51,23 @@ SCROLL_STEP_SENSITIVITY = 40
 ROLE_TYPE = Qt.ItemDataRole.UserRole + 1
 ROLE_DATA = Qt.ItemDataRole.UserRole + 2
 
+# ----------------- 0.0 설정 파일 경로 헬퍼 -----------------
+def _get_settings_file_path() -> str:
+    """
+    설정 파일(쓰기 가능)의 경로를 반환합니다.
+    - PyInstaller로 패키징된 경우: 실행 파일(.exe)이 위치한 디렉토리
+    - 스크립트 실행인 경우: 현재 작업 디렉토리
+    """
+    # sys.frozen은 PyInstaller에 의해 생성된 실행 파일인지 확인하는 일반적인 방법입니다.
+    if getattr(sys, 'frozen', False):
+        # 실행 파일(.exe)이 있는 디렉토리
+        base_path = os.path.dirname(sys.executable)
+    else:
+        # 스크립트 실행 환경 (현재 작업 디렉토리)
+        base_path = os.path.abspath(".")
+        
+    return os.path.join(base_path, SETTINGS_FILE)
+
 # ----------------- 0.0 설정 파일 로드/저장 유틸리티 (즐겨찾기 버퍼 구조 추가) -----------------
 DEFAULT_SETTINGS = {
     "window_geometry": {"x": 200, "y": 180, "width": 960, "height": 540},
@@ -61,10 +78,13 @@ DEFAULT_SETTINGS = {
 
 
 def load_settings() -> Dict[str, Any]:
-    if not os.path.exists(SETTINGS_FILE):
+    # 설정 파일 경로를 실행 파일 위치 기준으로 가져옴
+    settings_path = _get_settings_file_path() 
+    
+    if not os.path.exists(settings_path):
         return DEFAULT_SETTINGS.copy()
     try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+        with open(settings_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         # 하위 호환성을 위한 마이그레이션 로직
@@ -85,11 +105,14 @@ def load_settings() -> Dict[str, Any]:
 
 
 def save_settings(data: Dict[str, Any]):
+    # 설정 파일 경로를 실행 파일 위치 기준으로 가져옴
+    settings_path = _get_settings_file_path() 
+    
     try:
         if "favorites" in data:
             del data["favorites"]
 
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        with open(settings_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[ERROR] 설정 파일 저장 실패: {e}")
