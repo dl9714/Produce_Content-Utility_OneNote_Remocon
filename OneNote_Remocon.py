@@ -7,6 +7,7 @@ import uuid
 import ctypes
 from ctypes import wintypes
 from typing import Optional, List, Dict, Any
+import base64
 
 from PyQt6.QtWidgets import (
     QApplication,
@@ -38,6 +39,7 @@ from PyQt6.QtCore import (
     QSettings,
     QEvent,
     QRect,
+    QByteArray,
 )
 from PyQt6.QtGui import QIcon, QAction
 
@@ -51,6 +53,7 @@ SCROLL_STEP_SENSITIVITY = 40
 ROLE_TYPE = Qt.ItemDataRole.UserRole + 1
 ROLE_DATA = Qt.ItemDataRole.UserRole + 2
 
+
 # ----------------- 0.0 설정 파일 경로 헬퍼 -----------------
 def _get_settings_file_path() -> str:
     """
@@ -59,18 +62,20 @@ def _get_settings_file_path() -> str:
     - 스크립트 실행인 경우: 현재 작업 디렉토리
     """
     # sys.frozen은 PyInstaller에 의해 생성된 실행 파일인지 확인하는 일반적인 방법입니다.
-    if getattr(sys, 'frozen', False):
+    if getattr(sys, "frozen", False):
         # 실행 파일(.exe)이 있는 디렉토리
         base_path = os.path.dirname(sys.executable)
     else:
         # 스크립트 실행 환경 (현재 작업 디렉토리)
         base_path = os.path.abspath(".")
-        
+
     return os.path.join(base_path, SETTINGS_FILE)
+
 
 # ----------------- 0.0 설정 파일 로드/저장 유틸리티 (즐겨찾기 버퍼 구조 추가) -----------------
 DEFAULT_SETTINGS = {
     "window_geometry": {"x": 200, "y": 180, "width": 960, "height": 540},
+    "splitter_states": None,  # 새 설정 항목 추가
     "connection_signature": None,
     "favorites_buffers": {"기본 즐겨찾기 버퍼": []},
     "active_buffer": "기본 즐겨찾기 버퍼",
@@ -79,8 +84,8 @@ DEFAULT_SETTINGS = {
 
 def load_settings() -> Dict[str, Any]:
     # 설정 파일 경로를 실행 파일 위치 기준으로 가져옴
-    settings_path = _get_settings_file_path() 
-    
+    settings_path = _get_settings_file_path()
+
     if not os.path.exists(settings_path):
         return DEFAULT_SETTINGS.copy()
     try:
@@ -106,8 +111,8 @@ def load_settings() -> Dict[str, Any]:
 
 def save_settings(data: Dict[str, Any]):
     # 설정 파일 경로를 실행 파일 위치 기준으로 가져옴
-    settings_path = _get_settings_file_path() 
-    
+    settings_path = _get_settings_file_path()
+
     try:
         if "favorites" in data:
             del data["favorites"]
@@ -927,7 +932,7 @@ class OneNoteScrollRemoconApp(QMainWindow):
         super().__init__()
         ensure_pywinauto()
 
-        # 1. 설정 로드 및 창 위치 설정
+        # 1. 설정 로드 및 창 위치/상태 복원
         self.settings = load_settings()
         self.onenote_window = None
         self.tree_control = None
@@ -937,6 +942,42 @@ class OneNoteScrollRemoconApp(QMainWindow):
         self.my_pid = os.getpid()
         self._auto_center_after_activate = True
         self.active_buffer_name = None
+
+        # --- [START] 창 위치 복원 및 유효성 검사 로직 (수정됨) ---
+        geo_settings = self.settings.get(
+            "window_geometry", DEFAULT_SETTINGS["window_geometry"]
+        )
+
+        # 주 모니터의 사용 가능한 영역 가져오기 (작업 표시줄 제외)
+        primary_screen = QApplication.primaryScreen()
+        if not primary_screen:  # 헤드리스 환경 등 예외 처리
+            # 기본 가상 화면 크기 설정
+            screen_rect = QRect(0, 0, 1920, 1080)
+        else:
+            screen_rect = primary_screen.availableGeometry()
+
+        # 저장된 창 위치 QRect 객체로 생성
+        window_rect = QRect(
+            geo_settings.get("x", 200),
+            geo_settings.get("y", 180),
+            geo_settings.get("width", 960),
+            geo_settings.get("height", 540),
+        )
+
+        # 창이 화면에 보이는지 확인 (최소 100x50 픽셀이 보여야 함)
+        intersection = screen_rect.intersected(window_rect)
+        is_visible = intersection.width() >= 100 and intersection.height() >= 50
+
+        if not is_visible:
+            # 창이 화면 밖에 있으면 화면 중앙으로 이동
+            # 창 크기는 유지하되, 화면 크기보다 크지 않도록 조정
+            window_rect.setWidth(min(window_rect.width(), screen_rect.width()))
+            window_rect.setHeight(min(window_rect.height(), screen_rect.height()))
+            # 중앙 정렬
+            window_rect.moveCenter(screen_rect.center())
+
+        self.setGeometry(window_rect)
+        # --- [END] 창 위치 복원 및 유효성 검사 로직 ---
 
         # 즐겨찾기 복사 데이터 임시 저장소 (클립보드 역할)
         self.clipboard_data: Optional[Dict] = None
@@ -948,18 +989,6 @@ class OneNoteScrollRemoconApp(QMainWindow):
         icon_path = resource_path(APP_ICON_PATH)
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
-
-        geo = self.settings.get("window_geometry")
-        if isinstance(geo, dict):
-            self.setGeometry(
-                geo.get("x", 200),
-                geo.get("y", 180),
-                geo.get("width", 960),
-                geo.get("height", 540),
-            )
-        else:
-            self.setGeometry(200, 180, 960, 540)
-            self.settings["window_geometry"] = DEFAULT_SETTINGS["window_geometry"]
 
         self.init_ui("준비됨 (자동 재연결 중...)")
 
@@ -1115,12 +1144,12 @@ class OneNoteScrollRemoconApp(QMainWindow):
         main_layout.setContentsMargins(12, 12, 12, 12)
         main_layout.setSpacing(10)
 
-        main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_splitter.setChildrenCollapsible(False)
-        main_layout.addWidget(main_splitter, stretch=1)
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)  # self로 저장
+        self.main_splitter.setChildrenCollapsible(False)
+        main_layout.addWidget(self.main_splitter, stretch=1)
 
-        left_splitter = QSplitter(Qt.Orientation.Horizontal)
-        left_splitter.setChildrenCollapsible(False)
+        self.left_splitter = QSplitter(Qt.Orientation.Horizontal)  # self로 저장
+        self.left_splitter.setChildrenCollapsible(False)
 
         # 1. 즐겨찾기 버퍼 관리 패널 (가장 왼쪽)
         buffer_panel = QWidget()
@@ -1181,7 +1210,7 @@ class OneNoteScrollRemoconApp(QMainWindow):
         buffer_group_layout.addLayout(buffer_toolbar_bottom_layout)
 
         buffer_layout.addWidget(buffer_group)
-        left_splitter.addWidget(buffer_panel)
+        self.left_splitter.addWidget(buffer_panel)
 
         # 2. 즐겨찾기 관리 패널 (중앙)
         favorites_panel = QWidget()
@@ -1255,8 +1284,8 @@ class OneNoteScrollRemoconApp(QMainWindow):
         self.fav_tree.itemSelectionChanged.connect(self._update_move_button_state)
         left_layout.addWidget(fav_group, stretch=1)
 
-        left_splitter.addWidget(favorites_panel)
-        main_splitter.addWidget(left_splitter)
+        self.left_splitter.addWidget(favorites_panel)
+        self.main_splitter.addWidget(self.left_splitter)
 
         # 3. 오른쪽 패널 (변경 없음)
         right_panel = QWidget()
@@ -1371,34 +1400,80 @@ class OneNoteScrollRemoconApp(QMainWindow):
         right_layout.addWidget(search_group)
 
         right_layout.addStretch(1)
-        main_splitter.addWidget(right_panel)
+        self.main_splitter.addWidget(right_panel)
 
         self.connection_status_label = QLabel(initial_status)
         self.statusBar().addPermanentWidget(self.connection_status_label)
         self.statusBar().setStyleSheet(f"background-color: {COLOR_STATUS_BAR};")
 
-        left_splitter.setSizes([150, 250])
-        main_splitter.setSizes([400, 560])
+        # --- [START] 스플리터 상태 복원 로직 (수정됨) ---
+        # 저장된 스플리터 상태 불러오기
+        splitter_states = self.settings.get("splitter_states")
+        restored = False
+        if isinstance(splitter_states, dict):
+            try:
+                main_state_b64 = splitter_states.get("main")
+                if main_state_b64:
+                    main_state = QByteArray.fromBase64(main_state_b64.encode("ascii"))
+                    if not main_state.isEmpty():
+                        self.main_splitter.restoreState(main_state)
+
+                left_state_b64 = splitter_states.get("left")
+                if left_state_b64:
+                    left_state = QByteArray.fromBase64(left_state_b64.encode("ascii"))
+                    if not left_state.isEmpty():
+                        self.left_splitter.restoreState(left_state)
+
+                restored = True
+            except Exception as e:
+                print(f"[WARN] 스플리터 상태 복원 실패: {e}")
+                restored = False
+
+        # 복원에 실패했거나 저장된 상태가 없으면 기본값으로 설정
+        if not restored:
+            self.left_splitter.setSizes([150, 250])
+            self.main_splitter.setSizes([400, 560])
+        # --- [END] 스플리터 상태 복원 로직 ---
 
         self._update_move_button_state()
         self._update_buffer_move_button_state()
 
     # ----------------- 14.1 창 닫기 이벤트 핸들러 (Geometry/Favorites 저장) -----------------
+    def _save_window_state(self):
+        """창 지오메트리와 스플리터 상태를 self.settings에 업데이트하고 파일에 즉시 저장합니다."""
+        # self.settings (메모리)를 직접 수정합니다. load_settings()를 호출하지 않습니다.
+        # 이렇게 함으로써 다른 세션 변경사항이 유지됩니다.
+        if not self.isMinimized() and not self.isMaximized():
+            geom = self.geometry()
+            self.settings["window_geometry"] = {
+                "x": geom.x(),
+                "y": geom.y(),
+                "width": geom.width(),
+                "height": geom.height(),
+            }
+
+        try:
+            self.settings["splitter_states"] = {
+                "main": self.main_splitter.saveState()
+                .toBase64()
+                .data()
+                .decode("ascii"),
+                "left": self.left_splitter.saveState()
+                .toBase64()
+                .data()
+                .decode("ascii"),
+            }
+        except Exception as e:
+            print(f"[WARN] 스플리터 상태 저장 실패: {e}")
+
+        # 수정된 self.settings 객체 전체를 파일에 저장합니다.
+        # 즐겨찾기 등 다른 모든 변경사항도 함께 저장됩니다.
+        save_settings(self.settings)
+
     def closeEvent(self, event):
-        self._save_window_geometry()
+        self._save_window_state()  # 변경된 함수 호출
         self._save_favorites()
         super().closeEvent(event)
-
-    def _save_window_geometry(self):
-        geom = self.geometry()
-        current_settings = load_settings()
-        current_settings["window_geometry"] = {
-            "x": geom.x(),
-            "y": geom.y(),
-            "width": geom.width(),
-            "height": geom.height(),
-        }
-        save_settings(current_settings)
 
     def update_status_and_ui(self, status_text: str, is_connected: bool):
         self.connection_status_label.setText(status_text)
@@ -2440,14 +2515,34 @@ class OneNoteScrollRemoconApp(QMainWindow):
                         self.onenote_window, section_text, self.tree_control
                     )
                     if ok:
+                        # --- [START] 이름 복원 로직 추가 ---
+                        is_name_restored = False
+                        current_name = item.text(0)
+                        restored_name = current_name
+                        if current_name.startswith("(구) "):
+                            restored_name = current_name[4:]  # "(구) " 제거
+                            item.setText(0, restored_name)
+                            self._save_favorites()
+                            is_name_restored = True
+                        # --- [END] 이름 복원 로직 추가 ---
+
                         QTimer.singleShot(
                             500,
                             lambda: scroll_selected_item_to_center(
                                 self.onenote_window, self.tree_control
                             ),
                         )
-                        self.update_status_and_ui(f"활성화: '{display_name}'", True)
+
+                        if is_name_restored:
+                            self.update_status_and_ui(
+                                f"활성화: '{restored_name}' (이름 복원)", True
+                            )
+                        else:
+                            self.update_status_and_ui(f"활성화: '{display_name}'", True)
+
+                        return
                     else:
+                        # --- 실패 시 로직 (기존과 동일) ---
                         current_name = item.text(0)
 
                         if not current_name.startswith("(구) "):
